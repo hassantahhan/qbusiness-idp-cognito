@@ -1,0 +1,384 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Q Business using Identity Federation with Cognito Stack
+
+Resources:
+  UserPool:
+    Type: "AWS::Cognito::UserPool"
+    Properties:
+      UserPoolName: !Sub "${AWS::StackName}-user-pool"
+      UsernameConfiguration:
+        CaseSensitive: true
+      AutoVerifiedAttributes:
+        - email
+      MfaConfiguration: "OFF"
+      UserPoolAddOns:
+        AdvancedSecurityMode: "AUDIT"
+      LambdaConfig:
+        PreTokenGenerationConfig: 
+          LambdaArn: !GetAtt LambdaTriggerFunction.Arn
+          LambdaVersion: "V2_0"
+      AdminCreateUserConfig:
+          AllowAdminCreateUserOnly: true  
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Mutable: false
+          Required: true
+  
+  UserPoolDomain:
+    Type: "AWS::Cognito::UserPoolDomain"
+    Properties:
+      UserPoolId: !Ref UserPool
+      Domain: !Sub "${AWS::StackName}-${AWS::AccountId}"
+
+  UserPoolClient:
+    Type: "AWS::Cognito::UserPoolClient"
+    Properties:
+      ClientName: !Sub "${AWS::StackName}-client"
+      UserPoolId: !Ref UserPool
+      GenerateSecret: true
+
+  IdentityPool:
+    Type: "AWS::Cognito::IdentityPool"
+    Properties:
+      IdentityPoolName: !Sub "${AWS::StackName}-identity-pool"
+      AllowClassicFlow: true
+      AllowUnauthenticatedIdentities: false
+      CognitoIdentityProviders: 
+        - ClientId: !Ref UserPoolClient
+          ProviderName: !GetAtt UserPool.ProviderName
+
+  IdentityPoolRoleMapping:
+    Type: "AWS::Cognito::IdentityPoolRoleAttachment"
+    Properties:
+      IdentityPoolId: !Ref IdentityPool
+      Roles:
+        authenticated: !GetAtt CognitoAuthorizedRole.Arn
+
+  IdentityPoolPrincipalTag:
+    Type: "AWS::Cognito::IdentityPoolPrincipalTag"
+    Properties:
+      IdentityPoolId: !Ref IdentityPool
+      IdentityProviderName: !Select [1, !Split ["oidc-provider/", !GetAtt IDPOIDCProvider.Arn]]
+      PrincipalTags:
+        Email: "email"
+      UseDefaults: false
+
+  IDPOIDCProvider:
+    Type: 'AWS::IAM::OIDCProvider'
+    Properties:
+      Url: !Select [0, !Split ["/.well-known/jwks.json", !GetAtt UserPool.ProviderURL]]      
+      ClientIdList:
+        - !GetAtt UserPoolClient.ClientId
+
+  CognitoAuthorizedRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument: 
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal: 
+              Federated: "cognito-identity.amazonaws.com"
+            Action: 
+              - "sts:AssumeRoleWithWebIdentity"
+            Condition:
+              StringEquals: 
+                "cognito-identity.amazonaws.com:aud": !Ref IdentityPool
+              "ForAnyValue:StringLike":
+                "cognito-identity.amazonaws.com:amr": authenticated
+      Policies:
+        - PolicyName: "CognitoAuthorizedPolicy"
+          PolicyDocument: 
+            Version: "2012-10-17"
+            Statement: 
+              - Effect: "Allow"
+                Action:
+                  - "cognito-identity:GetCredentialsForIdentity"
+                Resource: "*"
+
+  LambdaTriggerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: "/"
+      Policies:
+        - PolicyName: AppendToLogsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+  
+  LambdaInvokePermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      FunctionName: !GetAtt LambdaTriggerFunction.Arn
+      Action: 'lambda:InvokeFunction'
+      Principal: cognito-idp.amazonaws.com
+      SourceArn: !GetAtt UserPool.Arn
+
+  LambdaTriggerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt LambdaTriggerRole.Arn
+      Code:
+        ZipFile: |
+          def handler(event, context):
+              email = event['request']['userAttributes']['email']
+              sub = event['request']['userAttributes']['sub']
+
+              # Create the JSON object
+              tags_object = {
+                  "principal_tags": {
+                      "Email": [email]
+                  }
+              }
+
+              claims = {}
+              claims["https://aws.amazon.com/tags"] = tags_object
+
+              event['response'] = {
+                  "claimsAndScopeOverrideDetails": {
+                      "idTokenGeneration": {
+                          "claimsToAddOrOverride": claims
+                      }
+                  }
+              }
+
+              return event
+
+  QBusinessApplication:
+    Type: 'AWS::QBusiness::Application'
+    Properties:
+      DisplayName: !Sub "${AWS::StackName}-qbusiness-app"
+      IdentityType: "AWS_IAM_IDP_OIDC"
+      IamIdentityProviderArn: !GetAtt IDPOIDCProvider.Arn
+      ClientIdsForOIDC:
+        - !GetAtt UserPoolClient.ClientId
+      AutoSubscriptionConfiguration:
+        AutoSubscribe: "ENABLED"
+        DefaultSubscriptionType: "Q_BUSINESS"
+
+  QBusinessRetriever:
+    Type: 'AWS::QBusiness::Retriever'
+    Properties:
+      ApplicationId: !GetAtt QBusinessApplication.ApplicationId
+      DisplayName: !Sub "${AWS::StackName}-qbusiness-retriever"
+      Type: "NATIVE_INDEX"
+      Configuration:
+        NativeIndexConfiguration:
+          IndexId: !GetAtt QBusinessIndex.IndexId
+
+  QBusinessIndex:
+    Type: 'AWS::QBusiness::Index'
+    Properties:
+      ApplicationId: !GetAtt QBusinessApplication.ApplicationId
+      DisplayName: !Sub "${AWS::StackName}-qbusiness-index"
+      Type: "ENTERPRISE"
+
+  QBusinessWebExperience:
+    Type: 'AWS::QBusiness::WebExperience'
+    Properties:
+      ApplicationId: !GetAtt QBusinessApplication.ApplicationId
+      RoleArn: !GetAtt QBusinessWebExperienceRole.Arn
+      IdentityProviderConfiguration:
+        OpenIDConnectConfiguration: 
+            SecretsArn : !GetAtt QBusinessClientSecret.Id
+            SecretsRole : !GetAtt QBusinessSecretsRole.Arn
+
+  QBusinessWebExperienceRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument: 
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal: 
+              Federated: !GetAtt IDPOIDCProvider.Arn
+            Action: 
+              - "sts:AssumeRoleWithWebIdentity"
+          - Effect: "Allow"
+            Principal: 
+              Federated: !GetAtt IDPOIDCProvider.Arn
+            Action: 
+              - "sts:TagSession"          
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/AdministratorAccess"
+
+  QBusinessSecretsRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument: 
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal: 
+              Service: 
+                - "application.qbusiness.amazonaws.com"
+            Action: 
+              - "sts:AssumeRole"
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/AdministratorAccess"
+
+  QBusinessClientSecret:
+    Type: 'AWS::SecretsManager::Secret'
+    Properties:
+      Name: !Sub "${AWS::StackName}-client-secret"
+      SecretString: !Sub '{"client_secret": "dummyvalue"}'
+
+  EvaluationUserCredentials:
+    Type: 'AWS::SecretsManager::Secret'
+    Properties:
+      Name: !Sub "${AWS::StackName}-evaluation-user"
+      SecretString: !Sub '{"username": "dummyvalue", "password": "dummyvalue"}'
+
+  UpdateOIDCDetailsCustom:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt UpdateOIDCDetailsLambdaFunction.Arn
+
+  UpdateOIDCDetailsLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: UpdateOIDCDetailsLambdaPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - cognito-idp:DescribeUserPoolClient
+                  - cognito-idp:UpdateUserPoolClient
+                  - secretsmanager:PutSecretValue
+                  - secretsmanager:GetSecretValue
+                Resource: "*"
+
+  UpdateOIDCDetailsLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: Update OIDC callback URL and client secret
+      Handler: index.handler
+      Runtime: python3.12
+      Role: !GetAtt 'UpdateOIDCDetailsLambdaRole.Arn'
+      Timeout: 10
+      Environment:
+        Variables:
+          userPoolId: !GetAtt UserPool.UserPoolId
+          userPoolClientId: !GetAtt UserPoolClient.ClientId
+          callbackUrl: !Sub "${QBusinessWebExperience.DefaultEndpoint}authorization-code/callback"
+          secretArn: !GetAtt QBusinessClientSecret.Id
+      Code:
+        ZipFile: |
+          from __future__ import print_function
+          import os
+          import json
+          import boto3
+          import urllib3
+
+          SUCCESS = 'SUCCESS'
+          FAILED = 'FAILED'
+          http = urllib3.PoolManager()
+
+          def handler(event, context):
+            print('handler() received event: ' + json.dumps(event))
+            status = FAILED
+            data = {}
+            try:
+              if event['RequestType'] == 'Create' or event['RequestType'] == 'Update':
+                update_oidc_details()
+                status = SUCCESS
+              elif event['RequestType'] == 'Delete':
+                print('deletion of CloudFormation stack has no impact on updating OIDC details')
+                status = SUCCESS
+            except Exception as e:
+              print('handler error: ' + str(e))
+              status = FAILED
+            send(event, context, status, data)
+            return
+
+          def update_oidc_details():
+            userPoolId = os.environ.get('userPoolId')
+            userPoolClientId = os.environ.get('userPoolClientId')
+            callbackUrl = os.environ.get('callbackUrl')
+            secretArn = os.environ.get('secretArn')
+
+            cognito_client = boto3.client('cognito-idp')
+            secrets_manager = boto3.client('secretsmanager')
+
+            response = cognito_client.describe_user_pool_client(
+                UserPoolId=userPoolId,
+                ClientId=userPoolClientId
+            )
+            client_secret = response['UserPoolClient'].get('ClientSecret')
+            secrets_manager.put_secret_value(
+                SecretId=secretArn,
+                SecretString=json.dumps({'client_secret': client_secret})
+            )
+            print("Secret updated successfully in Secrets Manager")
+            
+            update_params = {
+              'UserPoolId': userPoolId,
+              'ClientId': userPoolClientId,
+              'PreventUserExistenceErrors': 'ENABLED',
+              'AllowedOAuthFlowsUserPoolClient': True,
+              'AllowedOAuthFlows': ['code'],
+              'AllowedOAuthScopes': ['email', 'openid'],
+              'SupportedIdentityProviders': ['COGNITO'],
+              'ExplicitAuthFlows': ['ALLOW_REFRESH_TOKEN_AUTH', 'ALLOW_USER_SRP_AUTH', 'ALLOW_USER_PASSWORD_AUTH'],
+              'CallbackURLs': [callbackUrl]
+            }
+            cognito_client.update_user_pool_client(**update_params)
+            print("Callback URL updated successfully")
+            
+            return
+
+          def send(event, context, responseStatus, responseData, physicalResourceId=None, noEcho=False, reason=None):
+            responseUrl = event['ResponseURL']
+            print('responseUrl: ' + responseUrl)
+            responseBody = {
+              'Status' : responseStatus,
+              'Reason' : reason or "See the details in CloudWatch Log Stream: {}".format(context.log_stream_name),
+              'PhysicalResourceId' : physicalResourceId or context.log_stream_name,
+              'StackId' : event['StackId'],
+              'RequestId' : event['RequestId'],
+              'LogicalResourceId' : event['LogicalResourceId'],
+              'NoEcho' : noEcho,
+              'Data' : responseData
+            }
+            json_responseBody = json.dumps(responseBody)
+            print("Response body:")
+            print(json_responseBody)
+            headers = {
+              'content-type' : '',
+              'content-length' : str(len(json_responseBody))
+            }
+            try:
+              response = http.request('PUT', responseUrl, headers=headers, body=json_responseBody)
+              print("Status code:", response.status)
+            except Exception as e:
+              print("send(..) failed executing http.request(..):", e)
