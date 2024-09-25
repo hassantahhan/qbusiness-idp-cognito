@@ -37,20 +37,6 @@ Resources:
       ClientName: !Sub "${AWS::StackName}-client"
       UserPoolId: !Ref UserPool
       GenerateSecret: true
-      PreventUserExistenceErrors: "ENABLED"
-      AllowedOAuthFlowsUserPoolClient: true
-      AllowedOAuthFlows:
-        - "code"
-      AllowedOAuthScopes:
-        - "email"
-        - "openid" 
-      SupportedIdentityProviders:
-        - "COGNITO"
-      ExplicitAuthFlows:
-        - "ALLOW_REFRESH_TOKEN_AUTH"
-        - "ALLOW_USER_SRP_AUTH"
-      CallbackURLs:
-        - "https://dummyvalue.chat.qbusiness.us-east-1.on.aws/authorization-code/callback"
 
   IdentityPool:
     Type: "AWS::Cognito::IdentityPool"
