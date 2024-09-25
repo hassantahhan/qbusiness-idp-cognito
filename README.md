@@ -1,0 +1,3 @@
+### Amazon Q Business application using Identity Federation through IAM Example
+
+This repository provides a demonstration of how to use AWS CloudFormation automation to create a Q Business application using IAM Identity Federation with Amazon Cognito. The repository is simplistic and does not aim to provide production-ready code but rather serves as an example from which readers can benefit when building automated solutions.
