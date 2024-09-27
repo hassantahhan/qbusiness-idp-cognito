@@ -29,7 +29,11 @@ Resources:
     Type: "AWS::Cognito::UserPoolDomain"
     Properties:
       UserPoolId: !Ref UserPool
-      Domain: !Sub "${AWS::StackName}-${AWS::AccountId}"
+      Domain: !Join 
+        - ""
+        - - !Select [0, !Split ["-", !Select [2, !Split ["/", !Ref "AWS::StackId"]]]]
+          - !Select [1, !Split ["-", !Select [2, !Split ["/", !Ref "AWS::StackId"]]]]
+          - !Select [2, !Split ["-", !Select [2, !Split ["/", !Ref "AWS::StackId"]]]]
 
   UserPoolClient:
     Type: "AWS::Cognito::UserPoolClient"
