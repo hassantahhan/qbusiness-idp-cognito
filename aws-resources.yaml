@@ -86,6 +86,7 @@ Resources:
               Federated: "cognito-identity.amazonaws.com"
             Action: 
               - "sts:AssumeRoleWithWebIdentity"
+              - "sts:TagSession"
             Condition:
               StringEquals: 
                 "cognito-identity.amazonaws.com:aud": !Ref IdentityPool
