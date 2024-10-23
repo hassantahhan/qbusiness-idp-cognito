@@ -203,7 +203,7 @@ Resources:
       RoleArn: !GetAtt QBusinessWebExperienceRole.Arn
       IdentityProviderConfiguration:
         OpenIDConnectConfiguration: 
-            SecretsArn : !GetAtt QBusinessClientSecret.Id
+            SecretsArn : !GetAtt QBusinessOIDCClientSecret.Id
             SecretsRole : !GetAtt QBusinessSecretsRole.Arn
 
   QBusinessWebExperienceRole:
@@ -240,17 +240,11 @@ Resources:
       ManagedPolicyArns:
         - "arn:aws:iam::aws:policy/AdministratorAccess"
 
-  QBusinessClientSecret:
+  QBusinessOIDCClientSecret:
     Type: 'AWS::SecretsManager::Secret'
     Properties:
       Name: !Sub "${AWS::StackName}-client-secret"
       SecretString: !Sub '{"client_secret": "dummyvalue"}'
-
-  EvaluationUserCredentials:
-    Type: 'AWS::SecretsManager::Secret'
-    Properties:
-      Name: !Sub "${AWS::StackName}-evaluation-user"
-      SecretString: !Sub '{"username": "dummyvalue", "password": "dummyvalue"}'
 
   UpdateOIDCDetailsCustom:
     Type: AWS::CloudFormation::CustomResource
@@ -296,7 +290,7 @@ Resources:
           userPoolId: !GetAtt UserPool.UserPoolId
           userPoolClientId: !GetAtt UserPoolClient.ClientId
           callbackUrl: !Sub "${QBusinessWebExperience.DefaultEndpoint}authorization-code/callback"
-          secretArn: !GetAtt QBusinessClientSecret.Id
+          secretArn: !GetAtt QBusinessOIDCClientSecret.Id
       Code:
         ZipFile: |
           from __future__ import print_function
@@ -387,3 +381,198 @@ Resources:
               print("Status code:", response.status)
             except Exception as e:
               print("send(..) failed executing http.request(..):", e)
+
+  ChatPromptingCredentials:
+    Type: 'AWS::SecretsManager::Secret'
+    Properties:
+      Name: !Sub "${AWS::StackName}-chat-user"
+      SecretString: !Sub '{"username": "dummyvalue", "password": "dummyvalue"}'
+
+  ChatPromptingFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: UpdateOIDCDetailsCustom
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt ChatPromptingRole.Arn
+      Timeout: 10
+      Environment:
+        Variables:
+          COGNITO_DOMAIN: !Sub "${UserPoolDomain}.auth.${AWS::Region}.amazoncognito.com"
+          COGNITO_CLIENT_ID: !GetAtt UserPoolClient.ClientId
+          COGNITO_CLIENT_SECRET: !Join 
+            - ''
+            - - '{{resolve:secretsmanager:'
+              - !Ref QBusinessOIDCClientSecret
+              - ':SecretString:client_secret}}'
+          COGNITO_IDENTITY_POOL_ID: !Ref IdentityPool
+          COGNITO_USER_POOL_ID: !GetAtt UserPool.UserPoolId
+          QBUSINESS_APPLICATION_ID: !GetAtt QBusinessApplication.ApplicationId
+          QBUSINESS_WEB_EXPERIENCE_ROLE: !GetAtt QBusinessWebExperienceRole.Arn
+          CHAT_PROMPTING_CREDENTIALS_ID: !GetAtt ChatPromptingCredentials.Id
+      Code:
+        ZipFile: |
+          import os
+          import json
+          import hmac
+          import base64
+          import hashlib
+          import boto3
+          from botocore.exceptions import ClientError
+
+          # Set up your Cognito OIDC details
+          cognito_domain = os.environ['COGNITO_DOMAIN']
+          cognito_client_id = os.environ['COGNITO_CLIENT_ID']
+          cognito_client_secret = os.environ['COGNITO_CLIENT_SECRET']
+          cognito_identity_pool_id = os.environ['COGNITO_IDENTITY_POOL_ID']
+          cognito_user_pool_id = os.environ['COGNITO_USER_POOL_ID']
+          qbusiness_application_id = os.environ['QBUSINESS_APPLICATION_ID']
+          qbusiness_web_experience_role = os.environ['QBUSINESS_WEB_EXPERIENCE_ROLE']
+          user_credentials_id = os.environ['CHAT_PROMPTING_CREDENTIALS_ID']
+          
+          # Extract region from the Cognito domain
+          cognito_region = cognito_domain.split('.')[2]
+
+          def handler(event, context):
+              print("Starting lambda handler")
+              try:
+                  print("Attempting to get secret")
+                  username, password = get_secret()
+                  print(f"Secret retrieved successfully for username: {username}")
+
+                  print("Attempting to get Cognito credentials")
+                  credentials = get_cognito_credentials(username, password)
+                  print("Cognito credentials retrieved successfully")
+
+                  print("Attempting to call Q Business ChatSync")
+                  response = call_qbusiness_chat_sync(credentials)
+                  print("Q Business ChatSync returned successfully: " + response)
+
+                  print("Preparing successful response")
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': 'Authentication & Prompting successful',
+                          'response': response
+                      })
+                  }
+              except Exception as e:
+                  print(f"Error in lambda_handler: {str(e)}")
+                  return {
+                      'statusCode': 400,
+                      'body': json.dumps({
+                          'error': str(e)
+                      })
+                  }
+
+          def get_secret():
+              session = boto3.session.Session()
+              client = session.client(service_name='secretsmanager')
+              
+              try:
+                  get_secret_value_response = client.get_secret_value(SecretId=user_credentials_id)
+              except ClientError as e:
+                  raise Exception(f"Failed to retrieve secret: {str(e)}")
+              else:
+                  if 'SecretString' in get_secret_value_response:
+                      secret = json.loads(get_secret_value_response['SecretString'])
+                      return secret['username'], secret['password']
+                  else:
+                      raise Exception("Secret is not a string")
+
+          def get_cognito_credentials(username, password):
+              print("Starting get_cognito_credentials")
+              cognito_idp_client = boto3.client('cognito-idp')
+              cognito_identity_client = boto3.client('cognito-identity')
+              sts_client = boto3.client('sts')
+              
+              # Calculate SECRET_HASH
+              message = username + cognito_client_id
+              dig = hmac.new(cognito_client_secret.encode('utf-8'), 
+                            msg=message.encode('utf-8'), 
+                            digestmod=hashlib.sha256).digest()
+              secret_hash = base64.b64encode(dig).decode()
+              
+              try:
+                  # Authenticate with Cognito User Pool
+                  auth_response = cognito_idp_client.initiate_auth(
+                      ClientId=cognito_client_id,
+                      AuthFlow='USER_PASSWORD_AUTH',
+                      AuthParameters={
+                          'USERNAME': username,
+                          'PASSWORD': password,
+                          'SECRET_HASH': secret_hash
+                      }
+                  )
+                  
+                  id_token = auth_response['AuthenticationResult']['IdToken']
+                  
+                  # Get Identity ID
+                  get_id_response = cognito_identity_client.get_id(
+                      IdentityPoolId=cognito_identity_pool_id,
+                      Logins={
+                          f'cognito-idp.{cognito_region}.amazonaws.com/{cognito_user_pool_id}': id_token
+                      }
+                  )
+                  identity_id = get_id_response['IdentityId']
+
+                  # AssumeRoleWithWebIdentity
+                  assumed_role_response = sts_client.assume_role_with_web_identity(
+                    RoleArn=qbusiness_web_experience_role,
+                    RoleSessionName="WebExperienceSession",
+                    WebIdentityToken=id_token
+                  )
+
+                  print("Cognito tokens and credentials retrieved successfully")
+                  return assumed_role_response['Credentials']
+
+              except Exception as e:
+                  print(f"Error getting Cognito tokens and credentials: {str(e)}")
+                  raise
+
+          def call_qbusiness_chat_sync(credentials):
+              print("Starting call_qbusiness_chat_sync")
+              qbusiness_client = boto3.client('qbusiness', 
+                                              aws_access_key_id=credentials['AccessKeyId'],
+                                              aws_secret_access_key=credentials['SecretAccessKey'],
+                                              aws_session_token=credentials['SessionToken'])
+
+              try:
+                  chat_sync_response = qbusiness_client.chat_sync(applicationId=qbusiness_application_id,
+                                                        userMessage='What is AWS?')
+                  print("response:" + str(chat_sync_response))
+                  return chat_sync_response['systemMessage']
+              except ClientError as e:
+                  print(f"Error calling Q Business ChatSync: {str(e)}")
+                  raise Exception(f"Failed to call Q Business ChatSync: {str(e)}")
+
+  ChatPromptingRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: TestPromptingPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - secretsmanager:GetSecretValue
+                  - cognito-idp:InitiateAuth
+                  - cognito-idp:AdminInitiateAuth
+                  - cognito-idp:AdminGetUser
+                  - cognito-identity:GetId
+                  - cognito-identity:GetCredentialsForIdentity
+                  - qbusiness:ChatSync
+                Resource: '*'
